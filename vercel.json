@@ -1,14 +1,30 @@
 {
+    "version": 2,
     "builds": [
         {
-            "src": "./main.py",
-            "use": "@vercel/python"
+            "src": "main.py",
+            "use": "@vercel/python",
+            "config": {
+                "maxLambdaSize": "15mb",
+                "runtime": "python3.9"
+            }
         }
     ],
     "routes": [
-        { 
-            "src": "/(.*)", 
-            "dest": "/main.py" 
+        {
+            "src": "/ws",
+            "dest": "/main.py",
+            "continue": true
+        },
+        {
+            "src": "/(.*)",
+            "dest": "/main.py"
+        }
+    ],
+    "rewrites": [
+        {
+            "source": "/ws",
+            "destination": "/main.py"
         }
     ]
 }
