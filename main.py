@@ -5,14 +5,15 @@ Combines your business logic with real-time MongoDB Atlas integration
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient  # Async MongoDB driver
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field, BeforeValidator
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Annotated
 import os
 from dotenv import load_dotenv
 import json
 import asyncio
 import logging
+from bson import ObjectId
 
 load_dotenv()
 
@@ -21,6 +22,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Reconciliation Dashboard API", version="1.0.0")
+
+# Custom type for ObjectId conversion
+PyObjectId = Annotated[str, BeforeValidator(str)]
 
 # CORS middleware for React frontend
 app.add_middleware(
@@ -75,6 +79,51 @@ class VendorDetails(BaseModel):
     vendor: str
     contracts: int
     total_value: float
+
+class VendorStat(BaseModel):
+    vendor: str
+    matched: int
+    unmatched: int
+
+class InvoiceRawFields(BaseModel):
+    invoice_number: Optional[str] = None
+    po_number: Optional[str] = None
+    vendor_name: Optional[str] = None
+    amount_due: Optional[float] = None
+
+    @field_validator('amount_due', mode='before')
+    def clean_number(cls, v):
+        if v is None: return None
+        if isinstance(v, str): v = v.replace(',', '')
+        try: return float(v)
+        except (ValueError, TypeError): return None
+
+class InvoiceData(BaseModel):
+    id: PyObjectId = Field(..., alias='_id')
+    raw_fields: InvoiceRawFields
+    match_status: Optional[str] = None
+    class Config:
+        populate_by_name = True
+
+class PoRawFields(BaseModel):
+    po_number: Optional[str] = None
+    vendor_name: Optional[str] = None
+
+class POData(BaseModel):
+    id: PyObjectId = Field(..., alias='_id')
+    raw_fields: PoRawFields
+    po_date: Optional[str] = None
+    status: Optional[str] = None
+    total_amount: Optional[float] = None
+
+    @field_validator('total_amount', mode='before')
+    def clean_number(cls, v):
+        if v is None: return None
+        if isinstance(v, str): v = v.replace(',', '')
+        try: return float(v)
+        except (ValueError, TypeError): return None
+    class Config:
+        populate_by_name = True
 
 class ActivityItem(BaseModel):
     timestamp: datetime
@@ -424,6 +473,66 @@ async def get_supplier_values():
         logger.error(f"Error fetching supplier values: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching supplier values: {str(e)}")
 
+@app.get("/api/charts/vendor-stats", response_model=List[VendorStat])
+async def get_vendor_stats():
+    """Get matched/unmatched invoice counts by vendor"""
+    try:
+        invoice_collection = db.invoice_collection
+        
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$raw_fields.vendor_name",
+                    "matched": {
+                        "$sum": {
+                            "$cond": [ { "$in": [ "$match_status", ["matched_cumulative", "matched"] ] }, 1, 0 ]
+                        }
+                    },
+                    "unmatched": {
+                        "$sum": {
+                            "$cond": [ { "$not": { "$in": [ "$match_status", ["matched_cumulative", "matched"] ] } }, 1, 0 ]
+                        }
+                    }
+                }
+            },
+            {
+                "$project": {
+                    "vendor": "$_id",
+                    "matched": "$matched",
+                    "unmatched": "$unmatched",
+                    "_id": 0
+                }
+            },
+            {"$sort": {"vendor": 1}}
+        ]
+        
+        results = await invoice_collection.aggregate(pipeline).to_list(None)
+        return [item for item in results if item['vendor']]
+        
+    except Exception as e:
+        logger.error(f"Error fetching vendor stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching vendor stats: {str(e)}")
+
+@app.get("/api/invoices", response_model=List[InvoiceData])
+async def get_invoices_data():
+    """Get all invoices"""
+    try:
+        invoices_cursor = db.invoice_collection.find({}).limit(100)
+        return await invoices_cursor.to_list(length=100)
+    except Exception as e:
+        logger.error(f"Error fetching invoices: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching invoices: {str(e)}")
+
+@app.get("/api/purchase-orders", response_model=List[POData])
+async def get_pos_data():
+    """Get all purchase orders"""
+    try:
+        pos_cursor = db.po_collection.find({}).limit(100)
+        return await pos_cursor.to_list(length=100)
+    except Exception as e:
+        logger.error(f"Error fetching purchase orders: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching purchase orders: {str(e)}")
+
 @app.get("/api/activity-feed", response_model=List[ActivityItem])
 async def get_recent_activity():
     """Get recent processing activity"""
@@ -569,6 +678,7 @@ import asyncio
 async def watch_collection(collection):
     async with collection.watch() as stream:
         async for change in stream:
+            logger.info(f"Change detected in {collection.name}: {change}")
             stats = await get_complete_dashboard_stats()
             await manager.broadcast({
                 "type": "dashboard_stats",
@@ -585,9 +695,9 @@ async def startup_event():
     else:
         logger.info("🚀 Enhanced Reconciliation Dashboard API started successfully")
         # Start watchers for each collection
-        asyncio.create_task(watch_collection(db.po_collections))
-        asyncio.create_task(watch_collection(db.matching_result_collections))
-        asyncio.create_task(watch_collection(db.invoice_collections))
+        asyncio.create_task(watch_collection(db.po_collection))
+        asyncio.create_task(watch_collection(db.matching_result_collection))
+        asyncio.create_task(watch_collection(db.invoice_collection))
 
 @app.on_event("shutdown")
 async def shutdown_event():
