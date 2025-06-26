@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 import json
 import asyncio
 import logging
-from bson import ObjectId
 
 load_dotenv()
 
@@ -29,7 +28,7 @@ PyObjectId = Annotated[str, BeforeValidator(str)]
 # CORS middleware for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ap-sathish-frontend.vercel.app", "*"],
+    allow_origins=[os.getenv("FRONTEND_URL")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
