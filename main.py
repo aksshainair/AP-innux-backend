@@ -28,7 +28,7 @@ PyObjectId = Annotated[str, BeforeValidator(str)]
 # CORS middleware for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_URL")],
+    allow_origins=[os.getenv("FRONTEND_URL"), '*'],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -111,7 +111,7 @@ class PoRawFields(BaseModel):
 class POData(BaseModel):
     id: PyObjectId = Field(..., alias='_id')
     raw_fields: PoRawFields
-    po_date: Optional[str] = None
+    po_date: Optional[datetime] = None
     status: Optional[str] = None
     total_amount: Optional[float] = None
 
