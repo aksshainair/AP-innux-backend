@@ -727,6 +727,7 @@ class ReviewSubmission(BaseModel):
     decision: str
     reasoning: str
     reviewer_id: str
+    new_rule: Optional[str] = None
 
 @app.get("/api/reviews/pending")
 async def get_pending_reviews_endpoint():
@@ -750,7 +751,8 @@ async def submit_review_endpoint(request_id: str, submission: ReviewSubmission):
             request_id=request_id,
             reviewer_id=submission.reviewer_id,
             decision=submission.decision,
-            reasoning=submission.reasoning
+            reasoning=submission.reasoning,
+            new_rule=submission.new_rule
         )
         if not success:
             raise HTTPException(status_code=404, detail="Review request not found or failed to submit.")

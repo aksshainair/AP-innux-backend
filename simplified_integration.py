@@ -8,6 +8,7 @@ from enum import Enum
 import logging
 from datetime import datetime
 import uuid
+import json
 
 # --- Re-used components from langgraph and motor for context ---
 from langgraph.graph import StateGraph, START
@@ -221,30 +222,84 @@ class SimplifiedBusinessRulesEngine:
         
         return new_result
 
-    def _convert_to_business_rule(self, rule_data: Dict[str, Any]) -> Optional[BusinessRule]:
-        """Convert dictionary from DB to BusinessRule object"""
+    async def create_rule_from_string(self, rule_description: str, context_data: Dict[str, Any], decision: str):
+        """
+        Creates a simple business rule based on the review context and decision.
+        The rule condition is based on the vendor, and the description is provided by the user.
+        """
         try:
-            rule_data.pop('_id', None)
+            # The context for rule evaluation uses 'vendor_name'. The value comes from the review's 'vendor' field.
+            vendor_name = context_data.get("vendor")
+            if not vendor_name:
+                logger.warning(f"Cannot create rule: 'vendor' not found in review context.")
+                return
 
-            rule_data["conditions"] = [
+            try:
+                # Convert decision like "Approve" to RuleAction.APPROVE
+                action = RuleAction(decision.lower())
+            except ValueError:
+                logger.warning(f"Cannot create rule: invalid decision '{decision}' for rule action.")
+                return
+
+            rule_id = f"rule_{uuid.uuid4().hex[:8]}"
+
+            # Construct the document with the correct nested schema
+            rule_to_insert = {
+                "rule_id": rule_id,
+                "rule_type": "discrepancy",
+                "created_date": datetime.now(),
+                "created_by": "human_review",
+                "active": True,
+                "usage_count": 0,
+                "rule_data": {
+                    "name": f"Auto-Rule for vendor: {vendor_name}",
+                    "description": rule_description,  # User-provided string
+                    "priority": 100,
+                    # Condition: IF vendor_name IS 'the_vendor_from_context'
+                    "conditions": [{"field": "vendor_name", "operator": RuleOperator.EQUALS.value, "value": vendor_name}],
+                    # Consequence: THEN 'the_decision'
+                    "consequences": [{"action": action.value, "message": f"Auto-rule from human review: {decision}"}],
+                    "logic_operator": "AND"
+                }
+            }
+            
+            # Log the generated rule as a JSON string for clarity
+            logger.info(f"Generated rule for insertion:\n{json.dumps(rule_to_insert, indent=2, default=str)}")
+
+            await self.db.business_rules.insert_one(rule_to_insert)
+            logger.info(f"Successfully created and stored new business rule: {rule_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to create rule from description '{rule_description}': {e}", exc_info=True)
+
+    def _convert_to_business_rule(self, rule_data_from_db: Dict[str, Any]) -> Optional[BusinessRule]:
+        """Convert a (potentially nested) dictionary from DB to a flat BusinessRule object."""
+        try:
+            rule_data_from_db.pop('_id', None)
+            
+            # Unpack the nested rule_data structure into a flat dictionary
+            nested_details = rule_data_from_db.pop("rule_data", {})
+            flat_rule_data = {**rule_data_from_db, **nested_details}
+
+            # The rest of the function can now process the flattened dictionary
+            flat_rule_data["conditions"] = [
                 RuleCondition(operator=RuleOperator(c["operator"]), **{k: v for k, v in c.items() if k != 'operator'})
-                for c in rule_data.get("conditions", [])
+                for c in flat_rule_data.get("conditions", [])
             ]
-            rule_data["consequences"] = [
+            flat_rule_data["consequences"] = [
                 RuleConsequence(action=RuleAction(c["action"]), **{k: v for k, v in c.items() if k != 'action'})
-                for c in rule_data.get("consequences", [])
+                for c in flat_rule_data.get("consequences", [])
             ]
             
-            if 'created_date' in rule_data and isinstance(rule_data['created_date'], str):
-                rule_data['created_date'] = datetime.fromisoformat(rule_data['created_date'])
+            if 'created_date' in flat_rule_data and isinstance(flat_rule_data['created_date'], str):
+                flat_rule_data['created_date'] = datetime.fromisoformat(flat_rule_data['created_date'])
 
-            # Filter for keys that exist in the simplified BusinessRule dataclass
             valid_keys = {f.name for f in dataclasses.fields(BusinessRule)}
-            filtered_data = {k: v for k, v in rule_data.items() if k in valid_keys}
+            filtered_data = {k: v for k, v in flat_rule_data.items() if k in valid_keys}
 
             return BusinessRule(**filtered_data)
         except (ValueError, TypeError, KeyError) as e:
-            logger.error(f"Error converting data to BusinessRule: {e}. Data: {rule_data}")
+            logger.error(f"Error converting data to BusinessRule: {e}. Data: {rule_data_from_db}")
             return None
 
 async def create_sample_rules(db_client):
@@ -468,10 +523,10 @@ class SimplifiedHumanReviewManager:
         self.db = db_client
         self.notifications = SimpleNotificationService()
         self.pending_reviews: Dict[str, ReviewRequest] = {}
-        self.broadcast_function = None
+        self.broadcast_func = None
     
     def set_broadcast_function(self, broadcast_func):
-        self.broadcast_function = broadcast_func
+        self.broadcast_func = broadcast_func
     
     async def request_human_review(
         self, 
@@ -509,46 +564,77 @@ class SimplifiedHumanReviewManager:
         request_id: str, 
         reviewer_id: str, 
         decision: str,
-        reasoning: str
+        reasoning: str,
+        new_rule: Optional[str] = None
     ) -> bool:
-        """Submit human review response - simplified"""
-        review_request_data = await self.db.review_requests.find_one({
-            "request_id": request_id,
-            "status": ReviewStatus.PENDING.value
-        })
-
-        if not review_request_data:
-            logger.error(f"Pending review request {request_id} not found in database or already completed.")
-            return False
-
-        self.pending_reviews.pop(request_id, None)
-
-        if decision not in review_request_data["required_decision"]:
-            logger.error(f"Invalid decision '{decision}' for request {request_id}")
-            return False
+        """Submit a response for a review request"""
+        logger.info(f"Submitting review for {request_id} by {reviewer_id}")
         
-        response = ReviewResponse(
-            request_id=request_id,
-            reviewer_id=reviewer_id,
-            decision=decision,
-            reasoning=reasoning,
-            confidence=1.0 # Simplified
+        # Optionally create a new rule if one was provided.
+        # This part is outside the main transaction, as a rule creation failure
+        # shouldn't block the review submission itself.
+        if new_rule and new_rule.strip():
+            try:
+                # We fetch the review data first to get context, regardless of status.
+                review_request_data = await self.db.review_requests.find_one({"request_id": request_id})
+                if review_request_data:
+                    context_data = review_request_data.get("data", {})
+                    rules_engine = SimplifiedBusinessRulesEngine(self.db)
+                    # Pass the review decision to create a context-aware rule
+                    await rules_engine.create_rule_from_string(new_rule, context_data, decision)
+                else:
+                    logger.warning(f"Could not find review request {request_id} for rule creation context.")
+            except Exception as e:
+                logger.error(f"Non-critical error processing new rule '{new_rule}': {e}", exc_info=True)
+        
+        # Atomically find and update the review request.
+        # This prevents race conditions by ensuring the document is pending when we update it.
+        update_result = await self.db.review_requests.update_one(
+            {"request_id": request_id, "status": "pending"},
+            {
+                "$set": {
+                    "status": "completed",
+                    "response": {
+                        "reviewer_id": reviewer_id,
+                        "decision": decision,
+                        "reasoning": reasoning,
+                        "reviewed_at": datetime.now()
+                    }
+                }
+            }
         )
         
-        await self._store_review_response(response)
+        # If no document was modified, it means it wasn't in "pending" state or didn't exist.
+        if update_result.modified_count == 0:
+            logger.error(f"Failed to update review request {request_id}. It was either not found, not pending, or already updated by another process.")
+            return False
+
+        logger.info(f"Review {request_id} completed successfully by {reviewer_id}.")
         
-        if self.broadcast_function:
-            response_dict = asdict(response)
-            response_dict['reviewed_at'] = response_dict['reviewed_at'].isoformat()
-            await self.broadcast_function({"type": "completed_review", "data": response_dict})
+        # Broadcast the completion so the UI can update
+        try:
+            completed_review = await self.db.review_requests.find_one({"request_id": request_id})
+            if completed_review and self.broadcast_func:
+                await self.broadcast_func({
+                    "type": "completed_review",
+                    "data": self._convert_review_for_broadcast(completed_review)
+                })
+        except Exception as e:
+            logger.error(f"Failed to broadcast review completion for {request_id}: {e}")
             
         return True
 
     async def get_pending_reviews(self) -> List[Dict[str, Any]]:
-        db_reviews = await self.db.review_requests.find({
-            "status": ReviewStatus.PENDING.value
-        }).to_list(100)
-        return [self._convert_review_for_broadcast(r) for r in db_reviews]
+        """Get all pending human review requests"""
+        try:
+            db_reviews = await self.db.review_requests.find(
+                {"status": "pending"}
+            ).sort("created_at", -1).to_list(100)
+            
+            return [self._convert_review_for_broadcast(r) for r in db_reviews]
+        except Exception as e:
+            logger.error(f"Error getting pending reviews: {e}")
+            return []
         
     def _convert_review_for_broadcast(self, review_data: Dict) -> Dict[str, Any]:
         """Convert a review from DB to a dictionary suitable for broadcasting"""
@@ -558,19 +644,24 @@ class SimplifiedHumanReviewManager:
         return review_data
 
     async def _send_simple_notification(self, review_request: ReviewRequest):
-        if self.broadcast_function:
-            await self.broadcast_function({
+        if self.broadcast_func:
+            await self.broadcast_func({
                 "type": "new_review",
                 "data": self._convert_review_for_broadcast(asdict(review_request))
             })
 
     async def _store_review_request(self, review_request: ReviewRequest):
-        request_doc = asdict(review_request)
-        request_doc['status'] = review_request.status.value
-        request_doc['priority'] = review_request.priority.name
-        await self.db.review_requests.insert_one(request_doc)
+        """Stores the review request document in MongoDB."""
+        review_dict = asdict(review_request)
+        # Convert enums to their string values for JSON/BSON compatibility
+        review_dict['status'] = review_dict['status'].value
+        review_dict['priority'] = review_dict['priority'].value
+        
+        await self.db.review_requests.insert_one(review_dict)
+        logger.info(f"Stored human review request {review_request.request_id} in the database.")
 
     async def _store_review_response(self, response: ReviewResponse):
+        """Stores the response to a review in the database."""
         await self.db.review_responses.insert_one(asdict(response))
         await self.db.review_requests.update_one(
             {"request_id": response.request_id},
