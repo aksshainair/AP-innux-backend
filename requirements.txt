@@ -8,3 +8,8 @@ python-jose[cryptography]
 passlib[bcrypt]
 python-dateutil
 aiofiles
+langchain-openai
+langgraph
+openai
+aiohttp
+jinja2

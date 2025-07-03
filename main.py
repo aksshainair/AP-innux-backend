@@ -13,6 +13,24 @@ from dotenv import load_dotenv
 import json
 import asyncio
 import logging
+from langgraph.graph import START, END
+
+# --- NEW SIMPLIFIED INTEGRATION ---
+from simplified_integration import (
+    SimplifiedBusinessRulesEngine,
+    SimplifiedWorkflowEngine,
+    SimplifiedHumanReviewManager,
+    create_sample_rules,
+    SimplifiedWorkflowState,
+    SimplifiedWorkflowBuilder,
+    RuleAction,
+    ReviewPriority
+)
+
+# --- OLD INTEGRATION ---
+# from human_review_integration import (
+#     EnhancedBusinessRulesEngine,
+# )
 
 load_dotenv()
 
@@ -28,19 +46,28 @@ PyObjectId = Annotated[str, BeforeValidator(str)]
 # CORS middleware for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_URL"), '*'],
+    # Allow localhost for development.
+    # In production, you would use os.getenv("FRONTEND_URL")
+    allow_origins=[os.getenv("FRONTEND_URL"), "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # MongoDB Atlas connection
+# For local development, ensure your .env file sets MONGODB_ATLAS_URI
+# to your local MongoDB instance (e.g., "mongodb://localhost:27017")
 MONGODB_URL = os.getenv("MONGODB_ATLAS_URI") or os.getenv("MONGO_CONNECTION")
 DATABASE_NAME = os.getenv("DB_NAME", "accounting_db1") or os.getenv("MONGO_DATABASE", "accounting_db1")
 
 # Global variables for MongoDB
 mongodb_client = None
 db = None
+
+# Global variables for Human Review System
+rules_engine = None
+workflow_engine = None
+review_manager = None
 
 # Pydantic Models (from your original file + enhancements)
 class KPIMetrics(BaseModel):
@@ -189,7 +216,6 @@ def get_percentage_change(current: float, previous: float) -> float:
     if previous == 0:
         return 0.0
     return ((current - previous) / previous) * 100
-
 def get_date_range(days: int = 28) -> tuple:
     """Get date range for timeline charts"""
     end_date = datetime.now(timezone.utc)
@@ -591,66 +617,222 @@ async def get_recent_activity():
 
 @app.get("/api/dashboard/stats", response_model=DashboardStats)
 async def get_complete_dashboard_stats():
-    """Get all dashboard data in one call for real-time updates"""
+    # This function now acts as a high-level orchestrator for fetching all data
+    # It can be called by the frontend to get a complete snapshot
     try:
-        # Fetch all data concurrently
-        kpis_task = get_kpi_metrics()
-        po_timeline_task = get_po_timeline()
-        invoice_timeline_task = get_invoice_timeline()
-        supplier_values_task = get_supplier_values()
-        activity_task = get_recent_activity()
-        
-        kpis, po_timeline, invoice_timeline, supplier_values, recent_activity = await asyncio.gather(
-            kpis_task, po_timeline_task, invoice_timeline_task, supplier_values_task, activity_task
+        kpis, po_timeline, invoice_timeline, supplier_values, vendor_stats, invoices, pos, activity = await asyncio.gather(
+            get_kpi_metrics(),
+            get_po_timeline(),
+            get_invoice_timeline(),
+            get_supplier_values(),
+            get_vendor_stats(),
+            get_invoices_data(),
+            get_pos_data(),
+            get_recent_activity()
         )
-        
+
+        # Dummy data for components not yet fully implemented from scratch
+        department_distribution = [DepartmentData(department='Sales', value=120000, percentage=40.0), DepartmentData(department='R&D', value=180000, percentage=60.0)]
+        location_data = [LocationData(location='New York', lat=40.7128, lng=-74.0060, po_count=15, total_value=150000)]
+        vendor_details = [VendorDetails(location='New York', vendor='Tech Corp', contracts=5, total_value=75000)]
+
         return DashboardStats(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=datetime.now().isoformat(),
             kpis=kpis,
             po_timeline=po_timeline,
             invoice_timeline=invoice_timeline,
             supplier_values=supplier_values,
-            department_distribution=[],  # Implement if needed
-            location_data=[],  # Implement if needed
-            vendor_details=[],  # Implement if needed
-            recent_activity=recent_activity
+            department_distribution=department_distribution,
+            location_data=location_data,
+            vendor_details=vendor_details,
+            recent_activity=activity
         )
-        
     except Exception as e:
-        logger.error(f"Error fetching complete dashboard stats: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching dashboard stats: {str(e)}")
+        logger.error(f"Error fetching complete dashboard stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch dashboard statistics.")
 
-# WebSocket endpoint for real-time updates
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time dashboard updates"""
-    await manager.connect(websocket)
+async def define_invoice_processing_workflow(engine, rules_engine, review_manager):
+    """Defines the invoice processing workflow using the simplified builder."""
+    builder = SimplifiedWorkflowBuilder(engine)
+    
+    # Define workflow nodes (simplified)
+    async def extract_invoice_data(state: SimplifiedWorkflowState) -> SimplifiedWorkflowState:
+        # In a real scenario, this would involve OCR or parsing
+        state['po_number'] = "PO-001" 
+        state['extracted_invoice_data'] = {"total_amount": 1200, "vendor": "GLOBAL_TECH"}
+        return state
+
+    async def fetch_po_data(state: SimplifiedWorkflowState) -> SimplifiedWorkflowState:
+        state['po_data'] = {"total_amount": 1000, "vendor": "GLOBAL_TECH"}
+        return state
+
+    async def match_po_invoice(state: SimplifiedWorkflowState) -> SimplifiedWorkflowState:
+        po_total = state.get("po_data", {}).get("total_amount", 0)
+        inv_total = state.get("extracted_invoice_data", {}).get("total_amount", 0)
+        variance = abs(po_total - inv_total)
+        state['matching_result'] = {
+            "total_variance": variance,
+            "total_variance_percentage": (variance / po_total) * 100 if po_total else 0,
+            "has_discrepancy": variance > 0
+        }
+        return state
+
+    async def apply_business_rules(state: SimplifiedWorkflowState) -> SimplifiedWorkflowState:
+        context = {
+            "po_total": state.get("po_data", {}).get("total_amount", 0),
+            "vendor_name": state.get("po_data", {}).get("vendor", "Unknown"),
+            "total_variance_percentage": state.get("matching_result", {}).get("total_variance_percentage", 0),
+            "has_discrepancy": state.get("matching_result", {}).get("has_discrepancy", False)
+        }
+        # Use a generic rule type for this example
+        result = await rules_engine.evaluate_rules(context, "discrepancy")
+        
+        state['human_review_required'] = result.final_decision == RuleAction.REQUIRE_REVIEW
+        state['final_decision'] = result.final_decision.value if result.final_decision else "No Decision"
+        state['final_reasoning'] = "; ".join(result.messages)
+        return state
+
+    async def needs_human_review(state: SimplifiedWorkflowState) -> str:
+        return "human_review_node" if state.get('human_review_required') else END
+
+    async def human_review_node(state: SimplifiedWorkflowState) -> SimplifiedWorkflowState:
+        # This node would typically wait for human input.
+        # For this simplified model, we'll just log that it's waiting.
+        logger.info(f"Workflow {state['workflow_id']} is waiting for human review.")
+        state['metadata']['status'] = 'WAITING_FOR_INPUT'
+        # The workflow pauses here until a human submits a review via the API.
+        return state
+        
+    # Build the graph
+    builder.add_node("extract_invoice_data", extract_invoice_data)
+    builder.add_node("fetch_po_data", fetch_po_data)
+    builder.add_node("match_po_invoice", match_po_invoice)
+    builder.add_node("apply_business_rules", apply_business_rules)
+    builder.add_node("human_review_node", human_review_node)
+    
+    builder.add_edge(START, "extract_invoice_data")
+    builder.add_edge("extract_invoice_data", "fetch_po_data")
+    builder.add_edge("fetch_po_data", "match_po_invoice")
+    builder.add_edge("match_po_invoice", "apply_business_rules")
+    
+    builder.add_conditional_edge("apply_business_rules", needs_human_review, {
+        "human_review_node": "human_review_node",
+        END: END
+    })
+    
+    return builder.build("invoice_processing")
+
+# --- Human Review API Endpoints ---
+class ReviewSubmission(BaseModel):
+    decision: str
+    reasoning: str
+    reviewer_id: str
+
+@app.get("/api/reviews/pending")
+async def get_pending_reviews_endpoint():
+    """Get all pending human review requests."""
+    if not review_manager:
+        raise HTTPException(status_code=503, detail="Review system not initialized")
+    try:
+        pending_reviews = await review_manager.get_pending_reviews()
+        return pending_reviews
+    except Exception as e:
+        logger.error(f"Error fetching pending reviews: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch pending reviews.")
+
+@app.post("/api/reviews/{request_id}/submit")
+async def submit_review_endpoint(request_id: str, submission: ReviewSubmission):
+    """Submit a decision for a human review request."""
+    if not review_manager:
+        raise HTTPException(status_code=503, detail="Review system not initialized")
+    try:
+        success = await review_manager.submit_review_response(
+            request_id=request_id,
+            reviewer_id=submission.reviewer_id,
+            decision=submission.decision,
+            reasoning=submission.reasoning
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="Review request not found or failed to submit.")
+        
+        # Optionally, resume the workflow here if the design requires it.
+        # For simplicity, we assume the workflow is either terminal or handled elsewhere.
+
+        return {"status": "success", "message": "Review submitted successfully."}
+    except Exception as e:
+        logger.error(f"Error submitting review {request_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to submit review.")
+
+@app.post("/api/workflows/trigger-test")
+async def trigger_test_workflow():
+    """Triggers a test invoice processing workflow."""
+    if not workflow_engine:
+        raise HTTPException(status_code=503, detail="Workflow engine not initialized")
     
     try:
-        # Send initial data
-        stats = await get_complete_dashboard_stats()
-        await websocket.send_text(json.dumps({
-            "type": "dashboard_stats",
-            "data": stats.dict()
-        }, default=str))
+        initial_state = {"invoice_text": "Sample invoice text for testing."}
+        workflow_id = await workflow_engine.start_workflow("invoice_processing", initial_state)
         
+        # Asynchronously execute the workflow
+        asyncio.create_task(workflow_engine.execute_workflow(workflow_id))
+        
+        return {"message": "Test workflow triggered successfully", "workflow_id": workflow_id}
+    except Exception as e:
+        logger.error(f"Error triggering test workflow: {e}")
+        raise HTTPException(status_code=500, detail="Failed to trigger workflow")
+
+@app.get("/api/workflows/{workflow_id}/status")
+async def get_workflow_status_endpoint(workflow_id: str):
+    """Get the status of a specific workflow."""
+    if not workflow_engine:
+        raise HTTPException(status_code=503, detail="Workflow engine not initialized")
+    
+    try:
+        status = await workflow_engine.get_workflow_status(workflow_id)
+        if "error" in status:
+            raise HTTPException(status_code=404, detail=status["error"])
+        return status
+    except Exception as e:
+        logger.error(f"Error getting workflow status for {workflow_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get workflow status")
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        # Send initial data
+        initial_reviews = await review_manager.get_pending_reviews()
+        await websocket.send_text(json.dumps({"type": "initial_reviews", "data": initial_reviews}, default=str))
+
+        stats = await get_complete_dashboard_stats()
+        await websocket.send_text(json.dumps({"type": "dashboard_update", "data": stats.model_dump()}, default=str))
+
         # Keep connection alive and send periodic updates
         while True:
-            await asyncio.sleep(5)  # Update every 5 seconds
+            await asyncio.sleep(15)  # Send a ping every 15 seconds
             try:
+                # You could send a simple ping message
+                # await websocket.send_text("ping")
+
+                # Or send updated data periodically
                 stats = await get_complete_dashboard_stats()
-                await websocket.send_text(json.dumps({
-                    "type": "dashboard_stats",
-                    "data": stats.dict()
-                }, default=str))
-            except Exception as e:
-                logger.error(f"Error sending periodic update: {e}")
+                await websocket.send_text(json.dumps({"type": "dashboard_update", "data": stats.model_dump()}, default=str))
+
+            except WebSocketDisconnect:
+                logger.info("WebSocket disconnected during periodic update.")
                 break
-                
+            except Exception as e:
+                # If the error is about the connection being closed, it's not a server error.
+                if "connection closed" in str(e).lower():
+                    logger.info(f"WebSocket connection closed pre-emptively: {e}")
+                else:
+                    # For other errors, we should still log them as errors.
+                    logger.error(f"Error sending periodic update: {e}")
+                break # Exit loop on other errors too
+
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.info("Client disconnected from WebSocket.")
+    finally:
         manager.disconnect(websocket)
 
 # Manual trigger for updates
@@ -672,35 +854,52 @@ async def trigger_dashboard_update():
         logger.error(f"Error triggering update: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-import asyncio
-
 async def watch_collection(collection):
-    async with collection.watch() as stream:
-        async for change in stream:
-            logger.info(f"Change detected in {collection.name}: {change}")
-            stats = await get_complete_dashboard_stats()
-            await manager.broadcast({
-                "type": "dashboard_stats",
-                "data": stats.dict()
-            })
+    logger.info(f"Starting watcher for collection: {collection.name}")
+    try:
+        async with collection.watch(full_document='updateLookup') as stream:
+            async for change in stream:
+                logger.info(f"Change detected in {collection.name}: {change}")
+                await manager.broadcast({
+                    "type": "db_update",
+                    "collection": collection.name,
+                    "data": change
+                })
+    except Exception as e:
+        logger.error(f"Error watching collection {collection.name}: {e}")
 
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
-    """Initialize MongoDB connection and start watchers on startup"""
-    success = await init_database()
-    if not success:
-        logger.error("Failed to connect to MongoDB on startup")
-    else:
-        logger.info("🚀 Enhanced Reconciliation Dashboard API started successfully")
-        # Start watchers for each collection
-        asyncio.create_task(watch_collection(db.po_collection))
-        asyncio.create_task(watch_collection(db.matching_result_collection))
-        asyncio.create_task(watch_collection(db.invoice_collection))
+    """Application startup: connect to DB, init services."""
+    global db, rules_engine, workflow_engine, review_manager
+    if not await init_database():
+        # Exit if DB connection fails
+        return
+
+    # Initialize services with direct DB access
+    review_manager = SimplifiedHumanReviewManager(db)
+    rules_engine = SimplifiedBusinessRulesEngine(db)
+    workflow_engine = SimplifiedWorkflowEngine(None, {"workflow_db": db}) # Simplified for this context
+
+    # Set the broadcast function for real-time updates
+    review_manager.set_broadcast_function(manager.broadcast)
+    
+    # Create sample business rules on startup
+    await create_sample_rules(db)
+    
+    # Define and register the invoice processing workflow
+    await define_invoice_processing_workflow(workflow_engine, rules_engine, review_manager)
+
+    # Start background tasks to watch collections
+    asyncio.create_task(watch_collection(db["invoices"]))
+    asyncio.create_task(watch_collection(db["purchase_orders"]))
+    asyncio.create_task(watch_collection(db["recent_activity"]))
+    logger.info("🚀 Application startup complete.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
+    """Application shutdown: close DB connection."""
     await close_database()
     logger.info("🛑 Application shutdown complete")
 
