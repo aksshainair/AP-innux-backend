@@ -3,6 +3,7 @@
 
 from typing import Dict, List, Any, Optional, Union, Callable, TypedDict
 from dataclasses import dataclass, field, asdict, is_dataclass
+import dataclasses
 from enum import Enum
 import logging
 from datetime import datetime
